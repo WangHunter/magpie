@@ -1514,6 +1514,9 @@ func balanceRead(ctx context.Context, p Provider) (amount string, parts, split [
 // subscription. new-api's /api/usage/token and any other query the user
 // named are a key's own.
 func balanceAccountWide(p Provider, src balanceSource, body []byte) bool {
+	if balanceKeyScoped(p) {
+		return false
+	}
 	if src.token != "" {
 		return true
 	}
@@ -1527,6 +1530,18 @@ func balanceAccountWide(p Provider, src balanceSource, body []byte) bool {
 		Mode string `json:"mode"`
 	}
 	return json.Unmarshal(body, &r) == nil && r.Mode == "unrestricted"
+}
+
+func balanceKeyScoped(p Provider) bool {
+	if balanceKeyNames.MatchString(p.BalanceURL) {
+		return true
+	}
+	for _, v := range p.Headers {
+		if balanceKeyNames.MatchString(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // OpenCodeConsole is where OpenCode shows a workspace's credits: the
@@ -1672,7 +1687,7 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 			continue
 		}
 		others := 0
-		if src.token != "" || zen {
+		if src.token != "" && !balanceKeyScoped(p) || zen {
 			// the account's balance is the same whichever key asks
 			jobs = append(jobs, job{p, "", false})
 			continue

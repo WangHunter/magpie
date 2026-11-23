@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -308,6 +309,121 @@ func TestNamedBalanceWithAccessToken(t *testing.T) {
 	p.BalanceToken = "tok"
 	if got, ok, err := Balance(context.Background(), p); err != nil || !ok || got != "$3.00" {
 		t.Fatalf("balance = %q %v %v", got, ok, err)
+	}
+}
+
+func TestNamedBalanceTokenWithKeyPlaceholderIsNotAccountWide(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+	keyBalanceCache.data = nil
+	t.Cleanup(func() { keyBalanceCache.data = nil })
+
+	const token = "shared-account-token"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != token {
+			http.Error(w, "unexpected token", http.StatusUnauthorized)
+			return
+		}
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			key = r.Header.Get("X-API-Key")
+		}
+		var balance int
+		switch key {
+		case "first-key":
+			balance = 5
+		case "second-key":
+			balance = 9
+		default:
+			http.Error(w, "unexpected key", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprintf(w, `{"balance":%d}`, balance)
+	}))
+	defer srv.Close()
+	for _, c := range []struct {
+		id      string
+		url     string
+		headers map[string]string
+	}{
+		{id: "url", url: srv.URL + "/balance?key={key}"},
+		{id: "header", url: srv.URL + "/balance", headers: map[string]string{"X-API-Key": "{key}"}},
+	} {
+		if err := Save(Provider{ID: c.id, Name: c.id, Chat: srv.URL + "/v1", Key: "first-key", KeyName: "first",
+			Keys: []KeyAccount{{Name: "second", Key: "second-key"}}, BalanceToken: token,
+			BalanceURL: c.url, BalancePath: "$balance", Headers: c.headers}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := KeyBalances(context.Background())
+	if len(got) != 4 {
+		t.Fatalf("got %d balance cards, want one per key: %+v", len(got), got)
+	}
+	for _, c := range []struct {
+		provider, user, key, balance string
+	}{
+		{"url", "first", "first-key", "$5.00"},
+		{"url", "second", "second-key", "$9.00"},
+		{"header", "first", "first-key", "$5.00"},
+		{"header", "second", "second-key", "$9.00"},
+	} {
+		var found bool
+		for _, q := range got {
+			if q.Provider != c.provider || q.User != c.user {
+				continue
+			}
+			found = true
+			if q.Balance != c.balance || q.SharedBalance != "" {
+				t.Errorf("%s %s card = %+v, want key balance %s", c.provider, c.user, q, c.balance)
+			}
+		}
+		if !found {
+			t.Errorf("missing %s %s balance card", c.provider, c.user)
+		}
+	}
+}
+
+func TestNamedBalanceTokenWithoutKeyPlaceholderIsAccountWide(t *testing.T) {
+	isolate(t)
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Setenv("PATH", h)
+	for _, v := range agentenv.Vars {
+		t.Setenv(v, "")
+	}
+	keyBalanceCache.data = nil
+	t.Cleanup(func() { keyBalanceCache.data = nil })
+
+	const token = "shared-account-token"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != token {
+			http.Error(w, "unexpected token", http.StatusUnauthorized)
+			return
+		}
+		fmt.Fprint(w, `{"balance":5}`)
+	}))
+	defer srv.Close()
+	if err := Save(Provider{ID: "shared", Name: "shared", Chat: srv.URL + "/v1", Key: "first-key", KeyName: "first",
+		Keys: []KeyAccount{{Name: "second", Key: "second-key"}}, BalanceToken: token,
+		BalanceURL: srv.URL + "/balance", BalancePath: "$balance"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := KeyBalances(context.Background())
+	if len(got) != 1 || got[0].Balance != "$5.00" || got[0].SharedBalance != "" {
+		t.Fatalf("got account balance cards %+v, want one shared card", got)
 	}
 }
 
